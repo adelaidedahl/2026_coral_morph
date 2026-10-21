@@ -4,10 +4,379 @@ output: html_document
 date: "2026-10-21"
 ---
 
+
+<!--
+Template for calculating gross carbonate production following
+Barkley et al. 2023 (NOAA Tech Memo NMFS-PIFSC-154), "Gross carbonate
+production calculations" (pp. 7-10) and the colony-level equations in Table 1.
+
+Workflow:
+  Step 1  surface cover (x_i) for every colony
+  Step 2  attach taxon-specific calcification rates (g_i, d_i, c_i)
+  Step 3  colony-level production p_i (Table 1; g CaCO3 yr^-1)
+  Step 4  transect-level production P_j (kg CaCO3 yr^-1)
+  Step 5  transect-level gross production G_prod,j (kg CaCO3 m^-2 yr^-1)
+  Step 6  site-level mean and SD of G_prod
+-->
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# libraries
+```{r libraries}
+library(tidyverse) # dplyr, tidyr, readr, stringr, ggplot2, lubridate
+library(here)      # project-relative file paths
+library(readxl)
+```
 
+# set constants 
+```{r constants}
+# Number of colony edges for encrusting/plating/foliose/table and laminar
+# columnar colonies (Table 1 assumes h = 2)
+h_edges <- 2
 
+# Laminar columnar split of surface cover (Table 1): 55% laminar, 45% columnar
+## maybe change this slightly?
+lc_laminar  <- 0.55
+lc_columnar <- 0.45
+
+# Fraction of the published extension rate assumed for non-tip/non-edge growth
+off_tip <- 0.1
+
+# IPRB default conversion factor (c_i) for "most branching" corals, used when
+# the matched IPRB row has no conversion factor
+c_default <- 0.256
+
+# CCA equation choice:
+#   "cca"        = all CCA uses p = x * g * d (Table 1 CCA equation; IPRB default) - ignoring morphotype
+cca_eq <- "cca"
+
+```
+
+# read csvs
+```{r}
+corals_raw <- read_csv(here::here("Data", "corals_FP26 - adult_sizes.csv"))
+
+```
+
+# Clean data
+
+```{r clean-data}
+corals <- corals_raw |>
+  mutate(
+    date       = mdy(date),
+    across(c(genus, species, morphotype), \(v) str_squish(v)), #removing floating spaces in the text columns
+    morphotype = str_to_lower(morphotype),
+    # "adult" was entered in the species field for one Cyphastrea record
+    species    = na_if(species, "adult"),
+    # IPRB taxon names: CCA is listed as "Crustose coralline algae"
+    taxon      = if_else(genus == "CCA", "Crustose coralline algae", genus),
+    colony_id  = row_number() # unique id so colony-level rows can be traced
+  )
+
+# Quick look at what's in the data set
+corals |> count(genus, species, morphotype, sort = TRUE)
+corals |> distinct(site, transect, date, length)
+```
+
+# Step 1: Surface cover (x~i~)
+
+`x_i` is the surface distance (cm) of each colony directly beneath the tape.
+
+- **Open branching**: `x1, x2, ... xn` are all branch diameters measured along
+  the transect line, so `x_i = sum(x1:xn)` (NCRMP-leveraged approach, p. 7).
+- **All other morphotypes**: `x_i = x1`.
+- `c` (colony height, cm) is carried along for reference but is **not** used in
+  the Table 1 equations, where `c_i` is the IPRB taxon-specific *conversion
+  factor* (proportion of the colony growing axial branches; Step 2).
+
+```{r surface-cover}
+corals_x <- corals |>
+  mutate(
+    x_i = if_else(
+      morphotype == "open branching",
+      rowSums(pick(matches("^x\\d+$")), na.rm = TRUE), # x1 + x2 + ... + xn
+      x1
+    ),
+    # Table 1 equation used for each colony
+    morph_code = case_when(
+      cca_eq == "cca" & genus == "CCA"                      ~ "cca",
+      morphotype %in% c("massive", "mounding", "mounding lobate",
+                        "free living")                      ~ "hemisphere",
+      morphotype %in% c("encrusting", "plating", "foliose",
+                        "table")                            ~ "edge",
+      morphotype %in% c("open branching", "closed branching",
+                        "columnar")                         ~ "branching",
+      morphotype == "laminar columnar"                      ~ "laminar_columnar",
+      morphotype == "cca"                                   ~ "cca",
+      .default = NA_character_
+    )
+  )
+
+# Any morphotypes that didn't map to an equation? (should be 0 rows)
+corals_x |> filter(is.na(morph_code)) |> count(morphotype)
+```
+
+# Step 2: Calcification rates (g~i~, d~i~, c~i~) from IPRB v1.3
+
+The IPRB "Calcification Rates" sheet gives one row per **genus × IPRB
+morphology** (no species-level rates). Columns used:
+
+| IPRB column                   | here     | meaning                                   |
+|-------------------------------|----------|-------------------------------------------|
+| `Genera/Taxon`                | `taxon`  | genus (or "Hard coral" generic rows)      |
+| `Morphology`                  | `iprb_morph` | IPRB morphology                       |
+| `Mean extension rate (cm/yr)` | `g`      | g~i~                                      |
+| `Mean density (g/cm3)`        | `d`      | d~i~                                      |
+| `Conversion Factor`           | `c_prop` | c~i~ (branching only)                     |
+
+The CCA "extension rate" (0.040) is already a calcification rate in
+g cm^-2^ yr^-1^ with no density, so `d` is set to 1 for CCA.
+
+```{r read-iprb-rates}
+iprb_rates <- read_excel(here::here("Data", "Indo-Pacific_Carbonate_Production_v1.3-Nov24.xlsx"), 
+                         sheet = "Calcification Rates", skip = 9) |>
+  select(taxon      = `Genera/Taxon`,
+         iprb_morph = Morphology,
+         g          = `Mean extension rate (cm/yr)`,
+         d          = `Mean density (g/cm3)`,
+         c_prop     = `Conversion Factor`) |>
+  filter(!is.na(g)) |> # drops non-calcifying categories (sand, turf, etc.)
+  mutate(iprb_morph = str_to_lower(iprb_morph),
+         d          = if_else(iprb_morph == "cca", 1, d))
+
+```
+
+### Match your morphotypes to IPRB morphologies
+
+Each of our morphotypes gets an ordered list of IPRB morphologies to try (`priority` 1 = first choice). 
+
+Laminar columnar colonies need two sets of rates: the laminar part (`LA`, from plating/foliose rates) and the columnar part (`CO`, from columnar rates). 
+
+Edit this table to change the matching.
+
+```{r morph-crosswalk}
+morph_crosswalk <- tribble(
+  ~morphotype,         ~part,  ~priority, ~iprb_morph,
+  "mounding",          "main", 1,         "massive",
+  "mounding",          "main", 2,         "submassive",
+  "encrusting",        "main", 1,         "encrusting",
+  "closed branching",  "main", 1,         "branching",
+  "closed branching",  "main", 2,         "corymbose",  # Acropora has no generic "branching"
+  "closed branching",  "main", 3,         "submassive",
+  "open branching",    "main", 1,         "branching",
+  "open branching",    "main", 2,         "corymbose",
+  "laminar columnar",  "LA",   1,         "plating",
+  "laminar columnar",  "LA",   2,         "foliose",
+  "laminar columnar",  "LA",   3,         "encrusting",
+  "laminar columnar",  "CO",   1,         "columnar",
+  "laminar columnar",  "CO",   2,         "submassive",
+  "laminar columnar",  "CO",   3,         "branching",
+  "cca",               "main", 1,         "cca"
+)
+
+# CCA rows only match the IPRB "cca" morphology, whatever their morphotype
+morph_crosswalk <- morph_crosswalk |>
+  bind_rows(
+    morph_crosswalk |> distinct(morphotype, part) |> mutate(priority = 99, iprb_morph = "cca")
+  )
+
+# Species-specific overrides (tried before the crosswalk), e.g. Acropora growth forms
+species_override <- tribble(
+  ~genus,     ~species,    ~iprb_morph,
+  "Acropora", "globiceps", "digitate"
+)
+```
+
+### Join rates to colonies
+
+For each colony (and each part, for laminar columnar), keep the
+highest-priority IPRB row for its genus. If the genus has no matching row, the
+generic IPRB **"Hard coral"** rate for that morphology is used instead
+(`priority` + 100, flagged as `rate_level = "Hard coral"`).
+
+```{r join-rates}
+candidates <- corals_x |>
+  mutate(morphotype = if_else(morph_code == "cca", "cca", morphotype)) |>
+  select(colony_id, taxon, genus, species, morphotype) |>
+  select(colony_id, taxon, genus, species, morphotype) |>
+  inner_join(morph_crosswalk, by = "morphotype", relationship = "many-to-many") |>
+  bind_rows(
+    corals_x |>
+      inner_join(species_override, by = c("genus", "species")) |>
+      transmute(colony_id, taxon, part = "main", priority = 0, iprb_morph)
+  )
+
+matched_rates <- candidates |>
+  bind_rows(candidates |> mutate(taxon = "Hard coral", priority = priority + 100)) |>
+  inner_join(iprb_rates, by = c("taxon", "iprb_morph")) |>
+  slice_min(priority, by = c(colony_id, part), with_ties = FALSE) |>
+  mutate(rate_level = if_else(priority >= 100, "Hard coral", "genus")) |>
+  select(colony_id, part, iprb_morph, rate_level, g, d, c_prop) |>
+  # one row per colony: main rates as g/d/c_prop, laminar columnar as g_LA, g_CO, ...
+  pivot_wider(names_from = part,
+              values_from = c(iprb_morph, rate_level, g, d, c_prop),
+              names_glue = "{.value}_{part}") |>
+  rename_with(\(v) str_remove(v, "_main$"))
+
+# get these back into original df
+corals_rates <- corals_x |>
+  left_join(matched_rates, by = "colony_id") |>
+  mutate(
+    # branching / columnar colonies need c_i; fall back to the IPRB default
+    c_prop    = if_else(morph_code == "branching", coalesce(c_prop, c_default), c_prop),
+    c_prop_CO = coalesce(c_prop_CO, c_default)
+  )
+
+# Which IPRB rows were used for each taxon x morphotype across the whole dataset
+corals_rates |>
+  count(genus, morphotype, iprb_morph, rate_level, iprb_morph_LA, iprb_morph_CO)
+
+# Colonies with no rates (should be 0 rows)
+corals_rates |>
+  filter(if_else(morph_code == "laminar_columnar", is.na(g_LA) | is.na(g_CO), is.na(g))) |>
+  count(genus, species, morphotype)
+```
+
+# Step 3: Colony-level production (p~i~; Table 1 Barkley et al. 2023)
+
+All equations return g CaCO~3~ yr^-1^ (x in cm, g in cm yr^-1^, d in g cm^-3^).
+
+| code               | Table 1 morphologies                    | equation |
+|--------------------|-----------------------------------------|----------|
+| `hemisphere`       | Massive, Mounding lobate, Free-living   | $p_i = \frac{d_i}{2}\left[\pi\left(g_i + \frac{x_i}{\pi}\right)^2 - \pi\left(\frac{x_i}{\pi}\right)^2\right]$ |
+| `edge`             | Encrusting, Plating, Foliose, Table     | $p_i = h g_i d_i + 0.1(x_i g_i d_i)$ |
+| `branching`        | Open & closed branching, Columnar       | $p_i = x_i c_i g_i d_i + 0.1 g_i d_i (x_i - x_i c_i)$ |
+| `laminar_columnar` | Laminar columnar                        | $p_i = [h g_{LA} d_{LA} + 0.1(0.55x_i g_{LA} d_{LA})] + [0.45x_i c_i g_{CO} d_{CO} + 0.1 g_{CO} d_{CO}(0.45x_i - 0.45x_i c_i)]$ |
+| `cca`              | CCA                                     | $p_i = x_i g_i d_i$ |
+
+> **Hemisphere equation:** Table 1 prints this as
+> $d_i[(g_i + x_i/\pi)^2(\pi - \pi(x_i/\pi)^2)]$, which isn't dimensionally
+> consistent. It's coded as the area between two half-circles of radius
+> $r = x_i/\pi$ and $r + g_i$. This matches the IPRB v1.3 "Formulas" sheet
+> (e.g. generic massive coral: slope = g·d = 1.089, intercept ≈ πg²d/2).
+>
+> **Laminar columnar:** Table 1 uses one d~i~; here the laminar and columnar
+> parts each use the density from their own IPRB row (identical to Table 1 when
+> those densities are equal).
+
+```{r production-functions}
+
+## setting all the equations for the coral morphotypes
+p_hemisphere <- function(x, g, d) {
+  r <- x / pi
+  d * (pi * (r + g)^2 - pi * r^2) / 2
+}
+
+p_edge <- function(x, g, d, h = h_edges) {
+  h * g * d + off_tip * (x * g * d)
+}
+
+p_branching <- function(x, c, g, d) {
+  (x * c * g * d) + off_tip * g * d * (x - x * c)
+}
+
+p_laminar_columnar <- function(x, c, g_la, d_la, g_co, d_co, h = h_edges) {
+  (h * g_la * d_la + off_tip * (lc_laminar * x * g_la * d_la)) +
+    p_branching(lc_columnar * x, c, g_co, d_co) # columnar part has the branching form
+}
+
+p_cca <- function(x, g, d) {
+  x * g * d
+}
+```
+
+```{r colony-production}
+colony_prod <- corals_rates |>
+  mutate(
+    p_i = case_when(
+      morph_code == "hemisphere"       ~ p_hemisphere(x_i, g, d),
+      morph_code == "edge"             ~ p_edge(x_i, g, d),
+      morph_code == "branching"        ~ p_branching(x_i, c_prop, g, d),
+      morph_code == "laminar_columnar" ~ p_laminar_columnar(x_i, c_prop_CO,
+                                                            g_LA, d_LA, g_CO, d_CO),
+      morph_code == "cca"              ~ p_cca(x_i, g, d)
+    )
+  )
+
+colony_prod |>
+  select(site, transect, genus, species, morphotype, iprb_morph, x_i, p_i) |>
+  head(20)
+```
+
+# Step 4: Transect-level production (P~j~)
+
+$P_j = \sum_{i=1}^{n} p_i$, converted from g to kg CaCO~3~ yr^-1^.
+
+`n_missing_p` counts colonies with no `p_i` (no matching rates); those
+transects will be underestimated.
+
+```{r transect-production}
+transect_prod <- colony_prod |>
+  group_by(date, site, transect, length) |>
+  summarise(
+    n_colonies  = n(),
+    n_missing_p = sum(is.na(p_i)),
+    P_j_kg      = sum(p_i, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  )
+```
+
+# Step 5: Transect-level gross production (G~prod,j~)
+
+$G_{prod,j} = P_j \left(\frac{10000}{L_j}\right)$, with $L_j$ = transect length
+(cm; the `length` column). Units: kg CaCO~3~ m^-2^ yr^-1^.
+
+```{r transect-gprod}
+transect_prod <- transect_prod |>
+  mutate(G_prod_j = P_j_kg * (10000 / length))
+
+transect_prod
+```
+
+# Step 6: Site-level gross production (G~prod~ ± σ)
+
+Mean and standard deviation of $G_{prod,j}$ across transects at each site.
+(`sd()` already uses the n − 1 denominator from the report.)
+
+Units; kg CaCO3 m-2 yr-1 (Barkley et al. 2023)
+
+```{r site-gprod}
+site_prod <- transect_prod |>
+  group_by(site) |>
+  summarise(
+    n_transects  = n(),
+    G_prod       = mean(G_prod_j),
+    G_prod_sd    = sd(G_prod_j),
+    n_missing_p  = sum(n_missing_p),
+    .groups = "drop"
+  )
+
+site_prod
+```
+
+# Plot
+
+```{r plot-site-gprod}
+site_prod |>
+  filter(!str_starts(site, "Tub_")) |>
+  ggplot(aes(x = fct_reorder(site, G_prod), y = G_prod)) +
+  geom_col(fill = "grey70") +
+  geom_errorbar(aes(ymin = G_prod - G_prod_sd, ymax = G_prod + G_prod_sd),
+                width = 0.3) +
+  coord_flip() +
+  labs(title = "GCP contribution from corals in Moorea (2026)",
+       x = "Site",
+       y = expression("Gross carbonate production (kg CaCO"[3]*" m"^-2*" yr"^-1*")")) +
+  theme_classic(base_size = 13)
+
+#ggsave(here::here("Outputs", "Oct21_gprod_plot.png"), width = 8, height = 7, dpi = 300)
+```
+
+# Exports
+```{r}
+#write_csv(colony_prod,   here::here("Outputs", "gprod_colony.csv"))
+#write_csv(transect_prod, here::here("Outputs", "gprod_transect.csv"))
+#write_csv(site_prod,     here::here("Outputs", "gprod_site.csv"))
+```
 
